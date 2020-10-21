@@ -19,9 +19,16 @@ contents:
     # Additionally, clients can write a file to /run/cloud-routes/$IP.down to force
     # a VIP as down. This is useful for graceful shutdown / upgrade.
     #
+    # Also, we will open a secondary port to handle API server requests that
+    # arrive on the vip. This is a workaround for https://bugzilla.netfilter.org/show_bug.cgi?id=1427
+    #
     # ~cdc~
 
     set -e
+
+    APISERVER_PORT="6443"
+    APISERVER_SECONDARY_PORT="6444"
+
 
     # the list of load balancer IPs that are assigned to this node
     declare -A vips
@@ -72,13 +79,13 @@ contents:
         for ipt_vip in $(iptables -w -t nat -S "${CHAIN_NAME}" | awk '$4{print $4}' | awk -F/ '{print $1}'); do
             if [[ -z "${vips[${ipt_vip}]}" ]]; then
                 echo removing stale vip "${ipt_vip}" for external clients
-                iptables -w -t nat -D "${CHAIN_NAME}" --dst "${ipt_vip}" -j REDIRECT
+                iptables -w -t nat -D "${CHAIN_NAME}" --dst "${ipt_vip}" -p tcp -j REDIRECT --to-port "${APISERVER_SECONDARY_PORT}"
             fi
         done
         for ipt_vip in $(iptables -w -t nat -S "${CHAIN_NAME}-local" | awk '$4{print $4}' | awk -F/ '{print $1}'); do
             if [[ -z "${vips[${ipt_vip}]}" ]] || [[ "${vips[${ipt_vip}]}" = down ]]; then
                 echo removing stale vip "${ipt_vip}" for local clients
-                iptables -w -t nat -D "${CHAIN_NAME}-local" --dst "${ipt_vip}" -j REDIRECT
+                iptables -w -t nat -D "${CHAIN_NAME}-local" --dst "${ipt_vip}" -p tcp -j REDIRECT --to-port "${APISERVER_SECONDARY_PORT}"
             fi
         done
     }
@@ -86,11 +93,11 @@ contents:
     add_rules() {
         for vip in "${!vips[@]}"; do
             echo "ensuring rule for ${vip} for external clients"
-            ensure_rule nat "${CHAIN_NAME}" --dst "${vip}" -j REDIRECT
+            ensure_rule nat "${CHAIN_NAME}" --dst "${vip}" -p tcp -j REDIRECT --to-port "${APISERVER_SECONDARY_PORT}"
 
             if [[ "${vips[${vip}]}" != down ]]; then
                 echo "ensuring rule for ${vip} for internal clients"
-                ensure_rule nat "${CHAIN_NAME}-local" --dst "${vip}" -j REDIRECT
+                ensure_rule nat "${CHAIN_NAME}-local" --dst "${vip}" -p tcp -j REDIRECT --to-port "${APISERVER_SECONDARY_PORT}"
             fi
         done
     }
@@ -144,9 +151,14 @@ contents:
         fi
     }
 
+    open_new_port_for_redirect() {
+        socat TCP-LISTEN:"${APISERVER_SECONDARY_PORT}",fork TCP:127.0.0.1:"${APISERVER_PORT}" &
+    }
+
     case "$1" in
       start)
         initialize
+        open_new_port_for_redirect
         while :; do
           list_lb_ips
           remove_stale
